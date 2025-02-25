@@ -1,4 +1,7 @@
 import datetime
+import json
+import os
+import os.path
 import time
 import warnings
 
@@ -8,41 +11,90 @@ import torch.utils.data
 import torchvision
 import torchvision.transforms
 import utils
+from PIL import Image
+from regression_dataset import ImageRegressionFolder
 from sampler import RASampler
 from torch import nn
+from torch.autograd import Function
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
-import json
-import os
-import os.path
-from regression_dataset import ImageRegressionFolder
-from PIL import Image
+from torchvision import transforms
 
+# from .vision import VisionDataset
 IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp")
 
+class ConfidenceLossFunction(Function):
+    @staticmethod
+    def forward(ctx, pred, target):
+        """
+                This method in the ConfidenceLossFunction uses the logic of the standard MSE loss, but calculates it separately for loaded and confidence outputs. Also, this function does not take the average error value at this stage, but stores the error value for each image separately.
+        Then we scale the error from the loaded output to the ground truth value of confidence. Next, we take the average value of loaded loss and confidence loss and sum them.
+                :param ctx:
+                :param pred:
+                :param target:
+                :return:
+        """
+        # Save tensors
+        loaded_pred, confidence_pred = pred[:, 0].unsqueeze(1), pred[:, 1].unsqueeze(1)
 
-class AccuracyWeightedConfidenceLoss(nn.Module):
-    def __init__(self, threshold=0.3, accuracy_weight=0.5):
-        super(AccuracyWeightedConfidenceLoss, self).__init__()
-        self.threshold = threshold
-        self.accuracy_weight = accuracy_weight
+        loaded_target, confidence_target = target[:, 0].unsqueeze(1), target[
+            :, 1
+        ].unsqueeze(1)
+        ctx.save_for_backward(
+            loaded_pred, confidence_pred, loaded_target, confidence_target
+        )
+
+        # Calculate loss
+        loaded_loss = (loaded_pred - loaded_target) ** 2
+        confidence_loss = (confidence_pred - confidence_target) ** 2
+
+        # Scale the loaded loss by the confidence
+        scaled_loaded_loss = loaded_loss * confidence_target
+
+        total_loss = scaled_loaded_loss.mean() + confidence_loss.mean()
+        return total_loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        This method in the ConfidenceLossFunction class computes the gradients of the loss with respect to the predicted values during backpropagation. It first retrieves the predictions and target labels saved during the forward pass, then calculates the gradients for two components: the loaded predictions and the confidence predictions. These gradients are normalized by the batch size, concatenated to form a single gradient for predictions, scaled by grad_output, and returned for further parameter updates in the model.
+        :param ctx:
+        :param grad_output:
+        :return:
+        """
+        (
+            loaded_pred,
+            confidence_pred,
+            loaded_target,
+            confidence_target,
+        ) = ctx.saved_tensors
+        # print("HERE HERE HERE")
+        # Compute gradients for the loaded
+        grad_loaded_pred = 2 * (loaded_pred - loaded_target) * confidence_target
+        grad_loaded_pred /= loaded_pred.size(0)  # Normalize by batch size
+
+        # Compute gradients for the confidence
+        grad_confidence_pred = 2 * (confidence_pred - confidence_target)
+        grad_confidence_pred /= confidence_pred.size(0)  # Normalize by batch size
+
+        # Ensure gradients have the same shape as the input pred
+        grad_loaded_pred = grad_loaded_pred.expand_as(loaded_pred)
+        grad_confidence_pred = grad_confidence_pred.expand_as(confidence_pred)
+
+        grad_pred = torch.cat([grad_loaded_pred, grad_confidence_pred], dim=1)
+        grad_pred *= grad_output
+
+        return grad_pred, None
+
+
+class ConfidenceLoss(nn.Module):
+    def __init__(self):
+        """"""
+        super(ConfidenceLoss, self).__init__()
 
     def forward(self, pred, target):
-
-        loaded_loss = (pred[:, 0] - target[:, 0]) ** 2
-        confidence_loss = (pred[:, 1] - target[:, 1]) ** 2
-
-        scaled_loaded_loss = loaded_loss * target[:, 1]
-
-        penalties = torch.zeros_like(loaded_loss)
-        for i in range(pred.size(0)):
-            if not threshold_accuracy(target[i].detach().cpu().numpy(), pred[i].detach().cpu().numpy(), self.threshold):
-                penalties[i] = 1.0  # Apply penalty for incorrect predictions
-
-        penalty_term = penalties.mean() * self.accuracy_weight
-
-        total_loss = scaled_loaded_loss.mean() + confidence_loss.mean() + penalty_term
-        return total_loss
+        """Apply ConfidenceLoss function"""
+        return ConfidenceLossFunction.apply(pred, target)
 
 
 class RegressionDataset(torch.utils.data.Dataset):
@@ -50,26 +102,28 @@ class RegressionDataset(torch.utils.data.Dataset):
         self.root_dir = os.path.join(root_dir, split)
         self.transform = transform
 
-        with open(annotations_file, 'r') as f:
+        with open(annotations_file, "r") as f:
             self.annotations = json.load(f)
 
-        self.image_files = [f for f in os.listdir(self.root_dir)
-                            if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-                            and f in self.annotations]
+        self.image_files = [
+            f
+            for f in os.listdir(self.root_dir)
+            if f.lower() in IMG_EXTENSIONS and f in self.annotations
+        ]
 
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, idx):
         img_name = self.image_files[idx]
-        image = Image.open(os.path.join(self.root_dir, img_name)).convert('RGB')
-        # print("HERE HERE HERE", self.annotations[img_name], img_name, self.annotations[img_name].keys())
-        if 'confidence' not in self.annotations[img_name] or 'loaded' not in self.annotations[img_name]:
+        image = Image.open(os.path.join(self.root_dir, img_name)).convert("RGB")
+
+        if "confidence" not in self.annotations[img_name] or "loaded" not in self.annotations[img_name]:
             raise KeyError(f"'confidence' key is missing for image {img_name}")
 
-        # Get both loaded and confidence values
-        loaded = self.annotations[img_name]['loaded']
-        confidence = self.annotations[img_name]['confidence']
+
+        loaded = self.annotations[img_name]["loaded"]
+        confidence = self.annotations[img_name]["confidence"]
 
         target = torch.tensor([loaded, confidence], dtype=torch.float32)
 
@@ -81,8 +135,7 @@ class RegressionDataset(torch.utils.data.Dataset):
 
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
     model.train()
-    # criterion = ConfidenceLoss().to(device)
-    criterion = AccuracyWeightedConfidenceLoss().to(device)
+    criterion = ConfidenceLoss().to(device)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
     metric_logger.add_meter("img/s", utils.SmoothedValue(window_size=10, fmt="{value}"))
@@ -126,6 +179,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
         metric_logger.meters["conf_mse"].update(conf_loss.item(), n=batch_size)
         metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
 
+
 def r2_score_torch(output, target):
     target_mean = torch.mean(target)
     ss_tot = torch.sum((target - target_mean) ** 2)
@@ -133,11 +187,14 @@ def r2_score_torch(output, target):
     r2 = 1 - ss_res / ss_tot
     return r2.item()
 
+
 import numpy as np
+
 ACCURACY_THRESHOLD = 0.3
 CONFIDENCE_THRESHOLD = 0.3
-def threshold_accuracy(gt: list, pred: np.ndarray, threshold: float = ACCURACY_THRESHOLD
-) -> bool:
+
+
+def threshold_accuracy(gt: list, pred: np.ndarray, threshold: float = ACCURACY_THRESHOLD) -> bool:
     """
     an image is accurate, if
         1) the predicted confidence is correct, by up to 0.3 error
@@ -157,6 +214,7 @@ def threshold_accuracy(gt: list, pred: np.ndarray, threshold: float = ACCURACY_T
             return True
     else:
         return False
+
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
     model.eval()
@@ -182,8 +240,6 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
 
             loaded_mse = nn.MSELoss()(output[:, 0], target[:, 0])
             conf_mse = nn.MSELoss()(output[:, 1], target[:, 1])
-            loaded_mae = nn.L1Loss()(output[:, 0], target[:, 0])
-            conf_mae = nn.L1Loss()(output[:, 1], target[:, 1])
             for pred, true in zip(output.cpu().numpy(), target.cpu().numpy()):
                 if threshold_accuracy(true, pred, threshold):
                     correct += 1
@@ -192,10 +248,7 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
             metric_logger.update(loss=loss.item())
             metric_logger.meters["loaded_mse"].update(loaded_mse.item(), n=batch_size)
             metric_logger.meters["conf_mse"].update(conf_mse.item(), n=batch_size)
-            metric_logger.meters["loaded_mae"].update(loaded_mae.item(), n=batch_size)
-            metric_logger.meters["conf_mae"].update(conf_mae.item(), n=batch_size)
             metric_logger.meters["loss"].update(loss.item(), n=batch_size)
-            # print("LOSS: ", loss.item() * image.size(0))
             running_loss += loss.item() * image.size(0)
             num_processed_samples += batch_size
 
@@ -204,29 +257,25 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
     all_outputs = torch.cat(all_outputs)
     all_targets = torch.cat(all_targets)
 
-
     loaded_r2 = r2_score_torch(all_outputs[:, 0], all_targets[:, 0])
     conf_r2 = r2_score_torch(all_outputs[:, 1], all_targets[:, 1])
     accuracy = correct / len(data_loader.dataset)
-
+    r2 = (loaded_r2 * all_targets[:, 1]).mean()
     metric_logger.synchronize_between_processes()
 
     print(
         f"{header} Loaded MSE: {metric_logger.loaded_mse.global_avg:.4f} | "
-        f"Loaded MAE: {metric_logger.loaded_mae.global_avg:.4f} | "
         f"Loaded R²: {loaded_r2:.4f}\n"
         f"Confidence MSE: {metric_logger.conf_mse.global_avg:.4f} | "
-        f"Confidence MAE: {metric_logger.conf_mae.global_avg:.4f} | "
-        f"Confidence R²: {conf_r2:.4f} |" 
+        f"Confidence R²: {conf_r2:.4f} |"
         f"Accuracy@{threshold}: {accuracy:.4f} | "
-        f"Custom loss: {metric_logger.loss}"
+        f"Custom loss: {metric_logger.loss} |"
+        f"R2: {r2} |"
     )
 
     return {
         "loaded_mse": metric_logger.loaded_mse.global_avg,
         "conf_mse": metric_logger.conf_mse.global_avg,
-        "loaded_mae": metric_logger.loaded_mae.global_avg,
-        "conf_mae": metric_logger.conf_mae.global_avg,
         "loaded_r2": loaded_r2,
         "conf_r2": conf_r2,
         "loss": metric_logger.loss,
@@ -243,15 +292,7 @@ def _get_cache_path(filepath):
     return cache_path
 
 
-def calculate_mse(output, target):
-    return torch.mean((output - target) ** 2)
-
-
-def calculate_mae(output, target):
-    return torch.mean(torch.abs(output - target))
-
-
-def load_data(traindir, valdir, args):
+def load_data(traindir, valdir, testdir, args):
     # Data loading code
     print("Loading data")
     val_resize_size, val_crop_size, train_crop_size = (
@@ -261,23 +302,21 @@ def load_data(traindir, valdir, args):
     )
     interpolation = InterpolationMode(args.interpolation)
 
+    # Load training data
     print("Loading training data")
     st = time.time()
     cache_path = _get_cache_path(traindir)
     if args.cache_dataset and os.path.exists(cache_path):
-
-
         print(f"Loading dataset_train from {cache_path}")
-        # TODO: this could probably be weights_only=True
-        dataset, _ = torch.load(cache_path, weights_only=False)
+        dataset_train, _ = torch.load(cache_path, weights_only=False)
     else:
-        # We need a default value for the variables below because args may come
-        # from train_quantization.py which doesn't define them.
         auto_augment_policy = getattr(args, "auto_augment", None)
         random_erase_prob = getattr(args, "random_erase", 0.0)
         ra_magnitude = getattr(args, "ra_magnitude", None)
         augmix_severity = getattr(args, "augmix_severity", None)
-        preset = presets.ClassificationPresetTrain(
+        dataset_train = ImageRegressionFolder(
+            traindir,
+            presets.ClassificationPresetTrain(
                 crop_size=train_crop_size,
                 interpolation=interpolation,
                 auto_augment_policy=auto_augment_policy,
@@ -286,110 +325,76 @@ def load_data(traindir, valdir, args):
                 augmix_severity=augmix_severity,
                 backend=args.backend,
                 use_v2=args.use_v2,
-            )
-        # print("PRESET", preset)
-        dataset = ImageRegressionFolder(
-            traindir,
-            preset,
+            ),
             annotations_file=args.annotations_file
         )
-        print("DATASET: ", len(dataset))
         if args.cache_dataset:
             print(f"Saving dataset_train to {cache_path}")
             utils.mkdir(os.path.dirname(cache_path))
-            utils.save_on_master((dataset, traindir), cache_path)
-    print("Took", time.time() - st)
+            utils.save_on_master((dataset_train, traindir), cache_path)
+    print("Train dataset size:", len(dataset_train))
+    print("Time taken:", time.time() - st)
 
+    # Load validation data
     print("Loading validation data")
     cache_path = _get_cache_path(valdir)
     if args.cache_dataset and os.path.exists(cache_path):
-        # Attention, as the transforms are also cached!
-        print(f"Loading dataset_test from {cache_path}")
-        # TODO: this could probably be weights_only=True
-        dataset_test, _ = torch.load(cache_path, weights_only=False)
+        print(f"Loading dataset_val from {cache_path}")
+        dataset_val, _ = torch.load(cache_path, weights_only=False)
     else:
-        if args.weights and args.test_only:
-            weights = torchvision.models.get_weight(args.weights)
-            preprocessing = weights.transforms(antialias=True)
-            if args.backend == "tensor":
-                preprocessing = torchvision.transforms.Compose([torchvision.transforms.PILToTensor(), preprocessing])
-
-        else:
-            preprocessing = presets.ClassificationPresetEval(
-                crop_size=val_crop_size,
-                resize_size=val_resize_size,
-                interpolation=interpolation,
-                backend=args.backend,
-                use_v2=args.use_v2,
-            )
-
-        dataset_test = ImageRegressionFolder(
+        preprocessing = presets.ClassificationPresetEval(
+            crop_size=val_crop_size,
+            resize_size=val_resize_size,
+            interpolation=interpolation,
+            backend=args.backend,
+            use_v2=args.use_v2,
+        )
+        dataset_val = ImageRegressionFolder(
             valdir,
             preprocessing,
             annotations_file=args.annotations_file
         )
-        print("DATASET TEST:", len(dataset_test))
+        if args.cache_dataset:
+            print(f"Saving dataset_val to {cache_path}")
+            utils.mkdir(os.path.dirname(cache_path))
+            utils.save_on_master((dataset_val, valdir), cache_path)
+    print("Validation dataset size:", len(dataset_val))
+
+    print("Loading test data")
+    cache_path = _get_cache_path(testdir)
+    if args.cache_dataset and os.path.exists(cache_path):
+        print(f"Loading dataset_test from {cache_path}")
+        dataset_test, _ = torch.load(cache_path, weights_only=False)
+    else:
+        preprocessing = presets.ClassificationPresetEval(
+            crop_size=val_crop_size,
+            resize_size=val_resize_size,
+            interpolation=interpolation,
+            backend=args.backend,
+            use_v2=args.use_v2,
+        )
+        dataset_test = ImageRegressionFolder(
+            testdir,
+            preprocessing,
+            annotations_file=args.annotations_file
+        )
         if args.cache_dataset:
             print(f"Saving dataset_test to {cache_path}")
             utils.mkdir(os.path.dirname(cache_path))
-            utils.save_on_master((dataset_test, valdir), cache_path)
-
+            utils.save_on_master((dataset_test, testdir), cache_path)
+    print("Test dataset size:", len(dataset_test))
     print("Creating data loaders")
     if args.distributed:
-        if hasattr(args, "ra_sampler") and args.ra_sampler:
-            train_sampler = RASampler(dataset, shuffle=True, repetitions=args.ra_reps)
-        else:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(dataset_val, shuffle=False)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
     else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
+        train_sampler = torch.utils.data.RandomSampler(dataset_train)
+        val_sampler = torch.utils.data.SequentialSampler(dataset_val)
         test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
-    return dataset, dataset_test, train_sampler, test_sampler
+    return dataset_train, dataset_val, dataset_test, train_sampler, val_sampler, test_sampler
 
-
-# def load_data(train_dir, val_dir, args):
-#     # Define transforms
-#     train_transforms = torchvision.transforms.Compose([
-#         torchvision.transforms.RandomResizedCrop(224),
-#         torchvision.transforms.RandomHorizontalFlip(),
-#         torchvision.transforms.ToTensor(),
-#         torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-#                                          std=[0.229, 0.224, 0.225])
-#     ])
-#
-#     val_transforms = torchvision.transforms.Compose([
-#         torchvision.transforms.Resize(256),
-#         torchvision.transforms.CenterCrop(224),
-#         torchvision.transforms.ToTensor(),
-#         torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-#                                          std=[0.229, 0.224, 0.225])
-#     ])
-#
-#     # Create datasets
-#     dataset = RegressionDataset(
-#         root_dir=os.path.dirname(train_dir),
-#         split='train',
-#         annotations_file=args.annotations_file,
-#         transform=train_transforms
-#     )
-#
-#     dataset_test = RegressionDataset(
-#         root_dir=os.path.dirname(val_dir),
-#         split='val',
-#         annotations_file=args.annotations_file,
-#         transform=val_transforms
-#     )
-#
-#     # Handle distributed training
-#     if args.distributed:
-#         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-#         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
-#     else:
-#         train_sampler = torch.utils.data.RandomSampler(dataset)
-#         test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-#
-#     return dataset, dataset_test, train_sampler, test_sampler
 
 def main(args):
     if args.output_dir:
@@ -408,41 +413,29 @@ def main(args):
 
     train_dir = os.path.join(args.data_path, "train")
     val_dir = os.path.join(args.data_path, "val")
-    dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, args)
+    test_dir = os.path.join(args.data_path, "test")
+    dataset_train, dataset_val, dataset_test, train_sampler, val_sampler, test_sampler = \
+        load_data(train_dir, val_dir, test_dir, args)
 
-    # num_classes = len(dataset.classes)
-    # mixup_cutmix = get_mixup_cutmix(
-    #     mixup_alpha=args.mixup_alpha, cutmix_alpha=args.cutmix_alpha, num_classes=num_classes, use_v2=args.use_v2
-    # )
-    # if mixup_cutmix is not None:
-    #
-    #     def collate_fn(batch):
-    #         return mixup_cutmix(*default_collate(batch))
-    #
-    # else:
     collate_fn = default_collate
 
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train,
         batch_size=args.batch_size,
         sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=True,
         collate_fn=collate_fn,
     )
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, batch_size=args.batch_size, sampler=val_sampler, num_workers=args.workers, pin_memory=True
+    )
     data_loader_test = torch.utils.data.DataLoader(
         dataset_test, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.workers, pin_memory=True
     )
 
-    # print("Creating model", num_classes)
-    # model = torchvision.models.get_model(args.model, weights=args.weights)
-    # # model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-    # model.fc = torch.nn.Linear(model.fc.in_features, 2)
-    # model.to(device)
-
     print("Creating model")
     model = torchvision.models.get_model(args.model, weights=args.weights)
-
     model.fc = torch.nn.Sequential(
         torch.nn.Linear(model.fc.in_features, 256),
         torch.nn.ReLU(),
@@ -453,10 +446,8 @@ def main(args):
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    # criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    # criterion = nn.MSELoss()
-    # criterion = ConfidenceLoss().to(device)
-    criterion = AccuracyWeightedConfidenceLoss().to(device)
+    criterion = ConfidenceLoss().to(device)
+
     custom_keys_weight_decay = []
     if args.bias_weight_decay is not None:
         custom_keys_weight_decay.append(("bias", args.bias_weight_decay))
@@ -569,11 +560,11 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
+        train_one_epoch(model, criterion, optimizer, data_loader_train, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
+        val_metrics = evaluate(model, criterion, data_loader_val, device=device, log_suffix="Validation")
         if model_ema:
-            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+            evaluate(model_ema, criterion, data_loader_val, device=device, log_suffix="Validation EMA")
         if args.output_dir:
             checkpoint = {
                 "model": model_without_ddp.state_dict(),
@@ -586,8 +577,10 @@ def main(args):
                 checkpoint["model_ema"] = model_ema.state_dict()
             if scaler:
                 checkpoint["scaler"] = scaler.state_dict()
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+            print("Validation Accuracy", val_metrics[f"acc@{0.3}"])
+            if val_metrics[f"acc@{0.3}"] > 0.880:
+                utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
+                utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -719,12 +712,10 @@ def get_args_parser(add_help=True):
     parser.add_argument("--weights", default="DEFAULT", type=str, help="the weights enum name to load")
     parser.add_argument("--backend", default="PIL", type=str.lower, help="PIL or tensor - case insensitive")
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
-    parser.add_argument('--annotations_file', type=str, required=True,
-                        help='Path to the JSON annotations file')
+    parser.add_argument("--annotations_file", type=str, required=True, help="Path to the JSON annotations file")
     return parser
 
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()
     main(args)
-
