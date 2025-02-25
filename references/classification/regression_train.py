@@ -19,7 +19,7 @@ from torch.autograd import Function
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
 from torchvision import transforms
-
+from torch.utils.tensorboard import SummaryWriter
 # from .vision import VisionDataset
 IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp")
 
@@ -581,6 +581,8 @@ def main(args):
             if val_metrics[f"acc@{0.3}"] > 0.880:
                 utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
                 utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+            writer.add_scalar("Loss/train", val_metrics[f"loss"].median, epoch)
+            writer.add_scalar("Accuracy/train", val_metrics[f"acc@{0.3}"], epoch)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -717,5 +719,7 @@ def get_args_parser(add_help=True):
 
 
 if __name__ == "__main__":
+    writer = SummaryWriter(log_dir="/data/bruggen_regression/experiment_1")
     args = get_args_parser().parse_args()
     main(args)
+    writer.close()
