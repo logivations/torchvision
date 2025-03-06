@@ -136,6 +136,7 @@ class RegressionDataset(torch.utils.data.Dataset):
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
     model.train()
     criterion = ConfidenceLoss().to(device)
+    #criterion = nn.MSELoss().to(device)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
     metric_logger.add_meter("img/s", utils.SmoothedValue(window_size=10, fmt="{value}"))
@@ -178,7 +179,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
         metric_logger.meters["loaded_mse"].update(loaded_loss.item(), n=batch_size)
         metric_logger.meters["conf_mse"].update(conf_loss.item(), n=batch_size)
         metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
-
+    return loss.item()
 
 def r2_score_torch(output, target):
     target_mean = torch.mean(target)
@@ -374,7 +375,7 @@ def load_data(traindir, valdir, testdir, args):
             use_v2=args.use_v2,
         )
         dataset_test = ImageRegressionFolder(
-            testdir,
+            valdir,
             preprocessing,
             annotations_file=args.annotations_file
         )
@@ -385,7 +386,10 @@ def load_data(traindir, valdir, testdir, args):
     print("Test dataset size:", len(dataset_test))
     print("Creating data loaders")
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
+        if hasattr(args, "ra_sampler") and args.ra_sampler:
+            train_sampler = RASampler(dataset_train, shuffle=True, repetitions=args.ra_reps)
+        else:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
         val_sampler = torch.utils.data.distributed.DistributedSampler(dataset_val, shuffle=False)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
     else:
@@ -436,17 +440,19 @@ def main(args):
 
     print("Creating model")
     model = torchvision.models.get_model(args.model, weights=args.weights)
-    model.fc = torch.nn.Sequential(
-        torch.nn.Linear(model.fc.in_features, 256),
-        torch.nn.ReLU(),
-        torch.nn.Linear(256, 2)
-    )
+    # model.fc = torch.nn.Sequential(
+    #     torch.nn.Linear(model.fc.in_features, 256),
+    #     torch.nn.ReLU(),
+    #     torch.nn.Linear(256, 2)
+    # )
+    model.fc = torch.nn.Sequential(nn.Linear(model.fc.in_features, 2), nn.Sigmoid())
     model.to(device)
 
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = ConfidenceLoss().to(device)
+    # criterion = nn.MSELoss().to(device)
 
     custom_keys_weight_decay = []
     if args.bias_weight_decay is not None:
@@ -475,6 +481,7 @@ def main(args):
             parameters, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, eps=0.0316, alpha=0.9
         )
     elif opt_name == "adamw":
+        print("INSIDE ADAM")
         optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
     else:
         raise RuntimeError(f"Invalid optimizer {args.opt}. Only SGD, RMSprop and AdamW are supported.")
@@ -557,10 +564,11 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
+    best_acc = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader_train, device, epoch, args, model_ema, scaler)
+        train_loss = train_one_epoch(model, criterion, optimizer, data_loader_train, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
         val_metrics = evaluate(model, criterion, data_loader_val, device=device, log_suffix="Validation")
         if model_ema:
@@ -578,11 +586,15 @@ def main(args):
             if scaler:
                 checkpoint["scaler"] = scaler.state_dict()
             print("Validation Accuracy", val_metrics[f"acc@{0.3}"])
-            if val_metrics[f"acc@{0.3}"] > 0.880:
+            if val_metrics[f"acc@{0.3}"] > best_acc:
+                best_acc = val_metrics[f"acc@{0.3}"]
                 utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
                 utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-            writer.add_scalar("Loss/train", val_metrics[f"loss"].median, epoch)
-            writer.add_scalar("Accuracy/train", val_metrics[f"acc@{0.3}"], epoch)
+            writer.add_scalar("Loss", val_metrics[f"loss"].median, epoch)
+            writer.add_scalar("Accuracy", val_metrics[f"acc@{0.3}"], epoch)
+            writer.add_scalar("lr", optimizer.param_groups[0]['lr'], epoch)
+            writer.add_scalar("Train Loss", train_loss, epoch)
+
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -719,7 +731,7 @@ def get_args_parser(add_help=True):
 
 
 if __name__ == "__main__":
-    writer = SummaryWriter(log_dir="/data/bruggen_regression/experiment_1")
+    writer = SummaryWriter(log_dir="/data/bruggen_regression/exp_14_new_layer_standart_aug")
     args = get_args_parser().parse_args()
     main(args)
     writer.close()
