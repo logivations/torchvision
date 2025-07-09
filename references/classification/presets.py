@@ -42,7 +42,7 @@ class ClassificationPresetTrain:
         elif backend != "pil":
             raise ValueError(f"backend can be 'tensor' or 'pil', but got {backend}")
 
-        transforms.append(T.RandomResizedCrop(crop_size, interpolation=interpolation, antialias=True))
+        # transforms.append(T.RandomResizedCrop(crop_size, interpolation=interpolation, antialias=True))
         if hflip_prob > 0:
             transforms.append(T.RandomHorizontalFlip(hflip_prob))
         if auto_augment_policy is not None:
@@ -97,10 +97,10 @@ class ClassificationPresetEval:
         elif backend != "pil":
             raise ValueError(f"backend can be 'tensor' or 'pil', but got {backend}")
 
-        transforms += [
-            T.Resize(resize_size, interpolation=interpolation, antialias=True),
-            T.CenterCrop(crop_size),
-        ]
+        #transforms += [
+        #    T.Resize(resize_size, interpolation=interpolation, antialias=True),
+        #    T.CenterCrop(crop_size),
+        #]
 
         if backend == "pil":
             transforms.append(T.PILToTensor())
